@@ -1,3 +1,7 @@
+[![Support via PayPal](https://img.shields.io/badge/PayPal-Support-003087?style=for-the-badge&logo=paypal&logoColor=white)](https://paypal.me/09274923910)
+[![Telegram](https://img.shields.io/badge/Telegram-Message%20Me-26A5E4?style=for-the-badge&logo=telegram&logoColor=white)](https://t.me/obakesenshi)
+[![Create VPN Account](https://img.shields.io/badge/Create%20VPN%20Account-SSH%20%7C%20V2Ray-00A8E8?style=for-the-badge\&logo=protonvpn\&logoColor=white)](https://opencfg.xyz)
+
 # CF Edge Scanner
 
 A single dashboard that scans Cloudflare's published IPv4 ranges for
