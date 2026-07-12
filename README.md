@@ -5,6 +5,65 @@ reachable edge IPs, ranks them by TCP latency, and (optionally) verifies
 the top candidates by running a real VLESS-over-WebSocket+TLS handshake
 through them using your own config, with selectable TLS-fragment presets.
 
+## About
+
+Cloudflare's DNS hands you whatever edge IP is convenient for *them*,
+not necessarily the fastest one reachable from *you*. This tool scans
+Cloudflare's published ranges directly, ranks reachable IPs by real TCP
+latency, and — the part that actually matters — verifies your specific
+VLESS config by running a real handshake through the candidate and
+confirming data actually flows, not just that the port is open.
+
+### Pros
+
+- **Real measurements, not simulated.** TCP reachability and latency
+  come from actual socket connections. VLESS verification does a
+  genuine TLS+WebSocket+VLESS handshake and only calls it "verified" if
+  a 2xx response with a real chunk of the requested bytes comes back —
+  a bare handshake ack isn't enough.
+- **Two independent levers, not conflated.** Edge selection (speed)
+  and fragment presets (firewall resistance) are separated in the UI,
+  because they trade off in opposite directions — you can optimize for
+  one without blindly paying the cost of the other.
+- **Zero server to run.** Deploys to Vercel's free tier; nothing to
+  patch or keep alive.
+- **Own it.** Open source, self-hostable, no telemetry, editable to
+  your own protocol/transport needs.
+- **Usable at scale without crashing the tab.** Handles large result
+  sets with capped rendering, collapsible sections, and full CSV export.
+
+### Cons / honest limitations
+
+- **Measures from Vercel's datacenter, not your device.** "Fastest"
+  here means fastest from Vercel's network position — genuinely
+  useful, but not the same question as "fastest from my home
+  connection." A location mismatch is inherent to any
+  serverless-hosted version of this idea.
+- **VLESS only** — VMess needs AEAD crypto plumbing not yet built.
+- **WebSocket+TLS transport only** (no gRPC/raw-TCP), since that's what
+  actually routes through Cloudflare's edge anyway.
+- **Fragment presets are JS-level**, not OS-level packet splitting —
+  real firewall resistance, but not as strong as dedicated tools that
+  manipulate packets below the application layer.
+- **"Mega Mode" is genuinely slower on serverless** than a dedicated
+  VPS with raw concurrency — batched by design, bounded by default.
+- **Single-user tool**, no persistent history/database — results live
+  for the session, export CSV if you want to keep them.
+
+### Real use cases
+
+- You're running your own V2Ray/Xray server behind Cloudflare in a
+  country where the default-resolved edge IP is throttled or blocked,
+  and you want to manually pin a working one.
+- You maintain a personal or small-group proxy and want to
+  periodically check which edges are fastest/still reachable.
+- You're diagnosing whether a specific Cloudflare PoP is being
+  selectively blocked, by comparing which candidates pass full
+  verification vs. which stall or get rejected.
+- You want a lightweight, self-hosted alternative to community
+  CF-IP-scanner scripts, deployable in one `vercel` command instead of
+  running a script locally.
+
 ## How it works
 
 1. **Reachability + latency** — `/api/scan` runs a bounded-concurrency
