@@ -1,0 +1,13 @@
+{
+  "functions": {
+    "pages/api/scan.js": {
+      "maxDuration": 60
+    },
+    "pages/api/proxytest.js": {
+      "maxDuration": 30
+    },
+    "pages/api/ranges.js": {
+      "maxDuration": 15
+    }
+  }
+}
