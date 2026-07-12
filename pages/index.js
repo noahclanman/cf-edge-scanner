@@ -9,12 +9,23 @@ const MODE_PRESETS = {
 const BATCH_SIZE = 250;
 const PARALLEL_BATCHES = 4;
 
-function scoreOf(row) {
-  const pingScore = 1000 / (1 + row.latencyMs);
-  if (row.ttfbMs == null) return Math.round(pingScore);
-  const ttfbScore = 1000 / (1 + row.ttfbMs);
-  const speedScore = (row.throughputMbps || 0) * 10;
-  return Math.round(pingScore * 0.4 + ttfbScore * 0.3 + speedScore * 0.3);
+const FRAGMENT_INFO = {
+  none: "No handshake splitting. Use this if connections already work fine — pure speed, zero added overhead.",
+  light: "2 small chunks, ~8ms delay. Mild resistance to basic firewalls, barely any latency cost.",
+  medium: "4 chunks, ~20ms delay. Good default if connections get blocked or reset occasionally.",
+  heavy: "8 tiny chunks, ~45ms delay. Most resistant to blocking, but the slowest of the four — use only if Medium still gets blocked.",
+};
+
+function scanScoreOf(row) {
+  return Math.round(1000 / (1 + row.latencyMs));
+}
+
+function proxyScoreOf(row) {
+  if (row.ttfbMs == null) return null;
+  const pingPart = 1000 / (1 + row.latencyMs);
+  const ttfbPart = 1000 / (1 + row.ttfbMs);
+  const speedPart = (row.throughputMbps || 0) * 10;
+  return Math.round(pingPart * 0.3 + ttfbPart * 0.4 + speedPart * 0.3);
 }
 
 function SweepRing({ active, pct }) {
@@ -53,15 +64,20 @@ export default function Home() {
   const [customDepth, setCustomDepth] = useState("");
   const [ports, setPorts] = useState([443]);
   const [concurrency, setConcurrency] = useState(60);
+
   const [vlessLink, setVlessLink] = useState("");
   const [fragmentPreset, setFragmentPreset] = useState("medium");
   const [testTargetHost, setTestTargetHost] = useState("speed.cloudflare.com");
+  const [testTargetPort, setTestTargetPort] = useState(80);
+  const [testTargetPath, setTestTargetPath] = useState("/__down?bytes=131072");
+  const [verifyCount, setVerifyCount] = useState(20);
 
   const [scanning, setScanning] = useState(false);
   const [testingTop, setTestingTop] = useState(false);
   const [progress, setProgress] = useState({ scanned: 0, alive: 0, target: 0 });
   const [rows, setRows] = useState(new Map());
-  const [sort, setSort] = useState({ key: "score", dir: "desc" });
+  const [scanSort, setScanSort] = useState({ key: "latencyMs", dir: "asc" });
+  const [vlessSort, setVlessSort] = useState({ key: "proxyScore", dir: "desc" });
   const [error, setError] = useState(null);
 
   const stopRef = useRef(false);
@@ -91,8 +107,8 @@ export default function Home() {
       for (const r of batchResults) {
         const key = `${r.ip}:${r.port}`;
         const existing = next.get(key) || {};
-        const merged = { ...existing, ...r, status: "alive" };
-        merged.score = scoreOf(merged);
+        const merged = { ...existing, ...r, tested: existing.tested || false };
+        merged.scanScore = scanScoreOf(merged);
         next.set(key, merged);
       }
       return next;
@@ -146,86 +162,113 @@ export default function Home() {
     setScanning(false);
   };
 
-  const testTop = useCallback(
-    async (n = 20) => {
-      if (!vlessLink.trim()) {
-        setError("Paste a vless:// link before running proxy tests.");
-        return;
-      }
-      setError(null);
-      setTestingTop(true);
-      const candidates = Array.from(rows.values())
-        .sort((a, b) => a.latencyMs - b.latencyMs)
-        .slice(0, n);
+  const testTop = useCallback(async () => {
+    if (!vlessLink.trim()) {
+      setError("Paste a vless:// link before running proxy tests.");
+      return;
+    }
+    setError(null);
+    setTestingTop(true);
+    const n = Math.max(1, parseInt(verifyCount, 10) || 20);
+    const candidates = Array.from(rows.values())
+      .sort((a, b) => a.latencyMs - b.latencyMs)
+      .slice(0, n);
 
-      for (const c of candidates) {
-        if (stopRef.current) break;
-        try {
-          const res = await fetch("/api/proxytest", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              ip: c.ip,
-              port: c.port,
-              link: vlessLink.trim(),
-              fragmentPreset,
-              testTarget: { host: testTargetHost, port: 80, path: "/__down?bytes=131072" },
-            }),
-          });
-          const data = await res.json();
-          setRows((prev) => {
-            const next = new Map(prev);
-            const key = `${c.ip}:${c.port}`;
-            const existing = next.get(key);
-            if (!existing) return prev;
-            const merged = {
-              ...existing,
-              ttfbMs: data.success ? data.ttfbMs : existing.ttfbMs,
-              throughputMbps: data.success ? data.throughputMbps : existing.throughputMbps,
-              status: data.success ? "verified" : "proxy-failed",
-              proxyError: data.success ? null : data.error,
-            };
-            merged.score = scoreOf(merged);
-            next.set(key, merged);
-            return next;
-          });
-        } catch (e) {
-          setError(e.message);
-        }
+    for (const c of candidates) {
+      if (stopRef.current) break;
+      try {
+        const res = await fetch("/api/proxytest", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            ip: c.ip,
+            port: c.port,
+            link: vlessLink.trim(),
+            fragmentPreset,
+            testTarget: {
+              host: testTargetHost,
+              port: parseInt(testTargetPort, 10) || 80,
+              path: testTargetPath,
+            },
+          }),
+        });
+        const data = await res.json();
+        setRows((prev) => {
+          const next = new Map(prev);
+          const key = `${c.ip}:${c.port}`;
+          const existing = next.get(key);
+          if (!existing) return prev;
+          const merged = {
+            ...existing,
+            tested: true,
+            ttfbMs: data.success ? data.ttfbMs : existing.ttfbMs ?? null,
+            throughputMbps: data.success ? data.throughputMbps : existing.throughputMbps ?? null,
+            proxyStatus: data.success ? "verified" : "failed",
+            proxyError: data.success ? null : data.error,
+          };
+          merged.proxyScore = proxyScoreOf(merged);
+          next.set(key, merged);
+          return next;
+        });
+      } catch (e) {
+        setError(e.message);
       }
-      setTestingTop(false);
-    },
-    [rows, vlessLink, fragmentPreset, testTargetHost]
-  );
+    }
+    setTestingTop(false);
+  }, [rows, vlessLink, fragmentPreset, testTargetHost, testTargetPort, testTargetPath, verifyCount]);
 
-  const sortedRows = useMemo(() => {
+  const sortedScanRows = useMemo(() => {
     const arr = Array.from(rows.values());
     arr.sort((a, b) => {
-      const av = a[sort.key] ?? -Infinity;
-      const bv = b[sort.key] ?? -Infinity;
-      return sort.dir === "asc" ? av - bv : bv - av;
+      const av = a[scanSort.key] ?? -Infinity;
+      const bv = b[scanSort.key] ?? -Infinity;
+      return scanSort.dir === "asc" ? av - bv : bv - av;
     });
     return arr;
-  }, [rows, sort]);
+  }, [rows, scanSort]);
 
-  const onSort = (key) => {
-    setSort((prev) =>
+  const sortedVlessRows = useMemo(() => {
+    const arr = Array.from(rows.values()).filter((r) => r.tested);
+    arr.sort((a, b) => {
+      const av = a[vlessSort.key] ?? -Infinity;
+      const bv = b[vlessSort.key] ?? -Infinity;
+      return vlessSort.dir === "asc" ? av - bv : bv - av;
+    });
+    return arr;
+  }, [rows, vlessSort]);
+
+  const onScanSort = (key) => {
+    setScanSort((prev) =>
+      prev.key === key ? { key, dir: prev.dir === "asc" ? "desc" : "asc" } : { key, dir: "asc" }
+    );
+  };
+
+  const onVlessSort = (key) => {
+    setVlessSort((prev) =>
       prev.key === key ? { key, dir: prev.dir === "asc" ? "desc" : "asc" } : { key, dir: "desc" }
     );
   };
 
-  const exportCsv = () => {
-    const header = "ip,port,latency_ms,ttfb_ms,throughput_mbps,score,status\n";
-    const body = sortedRows
-      .map((r) =>
-        [r.ip, r.port, r.latencyMs, r.ttfbMs ?? "", r.throughputMbps ?? "", r.score, r.status].join(",")
-      )
-      .join("\n");
+  const exportCsv = (kind) => {
+    let header, rowsToExport, mapFn, filename;
+    if (kind === "scan") {
+      header = "ip,port,latency_ms,scan_score\n";
+      rowsToExport = sortedScanRows;
+      mapFn = (r) => [r.ip, r.port, r.latencyMs, r.scanScore].join(",");
+      filename = "cf-scan-results.csv";
+    } else {
+      header = "ip,port,latency_ms,ttfb_ms,throughput_mbps,proxy_score,status\n";
+      rowsToExport = sortedVlessRows;
+      mapFn = (r) =>
+        [r.ip, r.port, r.latencyMs, r.ttfbMs ?? "", r.throughputMbps ?? "", r.proxyScore ?? "", r.proxyStatus].join(",");
+      filename = "cf-vless-verified-results.csv";
+    }
+    const body = rowsToExport.map(mapFn).join("\n");
     const blob = new Blob([header + body], { type: "text/csv" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = "cf-scan-results.csv";
+    a.download = filename;
     a.click();
     URL.revokeObjectURL(url);
   };
@@ -256,15 +299,8 @@ export default function Home() {
         </div>
       </header>
 
-      <section
-        style={{
-          background: "var(--panel)",
-          border: "1px solid var(--panel-border)",
-          borderRadius: 10,
-          padding: 20,
-          marginBottom: 20,
-        }}
-      >
+      {/* --- Scan config --- */}
+      <section style={panelStyle}>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: 18 }}>
           <Field label="Scan depth">
             <div style={{ display: "flex", gap: 8 }}>
@@ -346,135 +382,170 @@ export default function Home() {
         </div>
       </section>
 
-      <section
-        style={{
-          background: "var(--panel)",
-          border: "1px solid var(--panel-border)",
-          borderRadius: 10,
-          padding: 20,
-          marginBottom: 20,
-        }}
-      >
-        <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr 1fr", gap: 18 }}>
-          <Field label="VLESS link (vless://...)">
-            <input
-              placeholder="vless://uuid@domain:443?type=ws&security=tls&path=/ws&host=domain#name"
-              value={vlessLink}
-              onChange={(e) => setVlessLink(e.target.value)}
-              style={inputStyle()}
-            />
-          </Field>
+      {/* --- What scan vs verify actually do --- */}
+      <div style={infoBoxStyle}>
+        <strong style={{ color: "var(--amber)" }}>Scanning</strong> finds your fastest reachable
+        Cloudflare edge IP — pure speed, no tradeoff. <strong style={{ color: "var(--teal)" }}>Verifying</strong>{" "}
+        with your VLESS link confirms the tunnel actually works through that IP and measures real TTFB/speed.{" "}
+        <strong>Fragment presets</strong> are a separate, independent lever: they make the handshake harder for a
+        firewall to block, at the cost of a little latency — only turn them up if connections are actually getting
+        blocked, not for speed.
+      </div>
+
+      {/* --- VLESS verification config --- */}
+      <section style={panelStyle}>
+        <Field label="VLESS link (vless://...)">
+          <input
+            placeholder="vless://uuid@domain:443?type=ws&security=tls&path=/ws&host=domain#name"
+            value={vlessLink}
+            onChange={(e) => setVlessLink(e.target.value)}
+            style={inputStyle()}
+          />
+        </Field>
+
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: 18, marginTop: 18 }}>
           <Field label="Fragment preset">
-            <select
-              value={fragmentPreset}
-              onChange={(e) => setFragmentPreset(e.target.value)}
-              style={inputStyle()}
-            >
+            <select value={fragmentPreset} onChange={(e) => setFragmentPreset(e.target.value)} style={inputStyle()}>
               <option value="none">None</option>
               <option value="light">Light</option>
               <option value="medium">Medium</option>
               <option value="heavy">Heavy</option>
             </select>
+            <p style={captionStyle}>{FRAGMENT_INFO[fragmentPreset]}</p>
           </Field>
-          <Field label="Test target host">
+
+          <Field label="Verify top N candidates">
             <input
-              value={testTargetHost}
-              onChange={(e) => setTestTargetHost(e.target.value)}
+              type="number"
+              min={1}
+              max={200}
+              value={verifyCount}
+              onChange={(e) => setVerifyCount(e.target.value)}
               style={inputStyle()}
             />
+            <p style={captionStyle}>How many of your fastest-pinging scan results to actually test with a real VLESS handshake.</p>
           </Field>
         </div>
+
+        <div style={{ marginTop: 18 }}>
+          <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 6 }}>Test target</div>
+          <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr 2fr", gap: 10 }}>
+            <input placeholder="host" value={testTargetHost} onChange={(e) => setTestTargetHost(e.target.value)} style={inputStyle()} />
+            <input
+              type="number"
+              placeholder="port"
+              value={testTargetPort}
+              onChange={(e) => setTestTargetPort(e.target.value)}
+              style={inputStyle()}
+            />
+            <input placeholder="path" value={testTargetPath} onChange={(e) => setTestTargetPath(e.target.value)} style={inputStyle()} />
+          </div>
+          <p style={captionStyle}>
+            Your VLESS server fetches this URL on your behalf through the tunnel, so TTFB/speed reflect something
+            real. The default (speed.cloudflare.com) is Cloudflare's own public test endpoint — swap it only for
+            another host that serves real downloadable bytes at the given path.
+          </p>
+        </div>
+
         <div style={{ marginTop: 14, display: "flex", gap: 12, alignItems: "center" }}>
-          <button
-            onClick={() => testTop(20)}
-            disabled={testingTop || rows.size === 0}
-            style={secondaryButtonStyle}
-          >
-            {testingTop ? "Testing top candidates…" : "Verify top 20 with VLESS"}
+          <button onClick={testTop} disabled={testingTop || rows.size === 0} style={secondaryButtonStyle}>
+            {testingTop ? "Verifying candidates…" : `Verify top ${verifyCount} with VLESS`}
           </button>
-          <span style={{ color: "var(--muted)", fontSize: 12 }}>
-            Runs the real handshake through the current top-ranked reachable IPs.
-          </span>
         </div>
       </section>
 
-      {error && (
-        <div
-          style={{
-            background: "rgba(244,63,94,0.1)",
-            border: "1px solid var(--rose)",
-            color: "var(--rose)",
-            borderRadius: 8,
-            padding: "10px 14px",
-            marginBottom: 16,
-            fontSize: 13,
-          }}
-        >
-          {error}
-        </div>
-      )}
+      {error && <div style={errorBoxStyle}>{error}</div>}
 
-      <section
+      {/* --- Result 1: scan results --- */}
+      <ResultsTable
+        title={`SCAN RESULTS (${sortedScanRows.length})`}
+        rows={sortedScanRows}
+        onSort={onScanSort}
+        onExport={() => exportCsv("scan")}
+        emptyMessage="No results yet. Start a scan to populate this table."
+        columns={[
+          { key: "scanScore", label: "Score" },
+          { key: "ip", label: "IP" },
+          { key: "port", label: "Port" },
+          { key: "latencyMs", label: "Ping (ms)", fmt: (v) => v?.toFixed(1) },
+        ]}
+      />
+
+      {/* --- Result 2: vless verified results --- */}
+      <div style={{ marginTop: 20 }}>
+        <ResultsTable
+          title={`VLESS VERIFIED RESULTS (${sortedVlessRows.length})`}
+          rows={sortedVlessRows}
+          onSort={onVlessSort}
+          onExport={() => exportCsv("vless")}
+          emptyMessage="No candidates verified yet. Run 'Verify top N with VLESS' above."
+          columns={[
+            { key: "proxyScore", label: "Score" },
+            { key: "ip", label: "IP" },
+            { key: "port", label: "Port" },
+            { key: "latencyMs", label: "Ping (ms)", fmt: (v) => v?.toFixed(1) },
+            { key: "ttfbMs", label: "TTFB (ms)", fmt: (v) => (v != null ? v.toFixed(1) : "—") },
+            { key: "throughputMbps", label: "Speed (Mbps)", fmt: (v) => v ?? "—" },
+            { key: "proxyStatus", label: "Status", statusColumn: true },
+          ]}
+        />
+      </div>
+    </div>
+  );
+}
+
+function ResultsTable({ title, rows, onSort, onExport, emptyMessage, columns }) {
+  return (
+    <section style={{ ...panelStyle, padding: 0, overflow: "hidden" }}>
+      <div
         style={{
-          background: "var(--panel)",
-          border: "1px solid var(--panel-border)",
-          borderRadius: 10,
-          overflow: "hidden",
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          padding: "14px 18px",
+          borderBottom: "1px solid var(--panel-border)",
         }}
       >
-        <div
-          style={{
-            display: "flex",
-            justifyContent: "space-between",
-            alignItems: "center",
-            padding: "14px 18px",
-            borderBottom: "1px solid var(--panel-border)",
-          }}
-        >
-          <strong style={{ fontFamily: "var(--font-mono)", fontSize: 13 }}>
-            RESULTS ({sortedRows.length})
-          </strong>
-          <button onClick={exportCsv} disabled={sortedRows.length === 0} style={secondaryButtonStyle}>
-            Export CSV
-          </button>
-        </div>
-        <div style={{ overflowX: "auto" }}>
-          <table style={{ width: "100%", borderCollapse: "collapse", fontFamily: "var(--font-mono)", fontSize: 13 }}>
-            <thead>
-              <tr style={{ textAlign: "left", color: "var(--muted)" }}>
-                <Th onClick={() => onSort("score")}>Score</Th>
-                <Th onClick={() => onSort("ip")}>IP</Th>
-                <Th onClick={() => onSort("port")}>Port</Th>
-                <Th onClick={() => onSort("latencyMs")}>Ping (ms)</Th>
-                <Th onClick={() => onSort("ttfbMs")}>TTFB (ms)</Th>
-                <Th onClick={() => onSort("throughputMbps")}>Speed (Mbps)</Th>
-                <th style={{ padding: "8px 14px" }}>Status</th>
-              </tr>
-            </thead>
-            <tbody>
-              {sortedRows.slice(0, 500).map((r) => (
-                <tr key={`${r.ip}:${r.port}`} style={{ borderTop: "1px solid var(--panel-border)" }}>
-                  <td style={td}>{r.score}</td>
-                  <td style={td}>{r.ip}</td>
-                  <td style={td}>{r.port}</td>
-                  <td style={td}>{r.latencyMs?.toFixed(1)}</td>
-                  <td style={td}>{r.ttfbMs?.toFixed(1) ?? "—"}</td>
-                  <td style={td}>{r.throughputMbps ?? "—"}</td>
-                  <td style={{ ...td, color: statusColor(r.status) }}>{r.status}</td>
-                </tr>
+        <strong style={{ fontFamily: "var(--font-mono)", fontSize: 13 }}>{title}</strong>
+        <button onClick={onExport} disabled={rows.length === 0} style={secondaryButtonStyle}>
+          Export CSV
+        </button>
+      </div>
+      <div style={{ overflowX: "auto" }}>
+        <table style={{ width: "100%", borderCollapse: "collapse", fontFamily: "var(--font-mono)", fontSize: 13 }}>
+          <thead>
+            <tr style={{ textAlign: "left", color: "var(--muted)" }}>
+              {columns.map((c) => (
+                <Th key={c.key} onClick={() => onSort(c.key)}>
+                  {c.label}
+                </Th>
               ))}
-              {sortedRows.length === 0 && (
-                <tr>
-                  <td colSpan={7} style={{ ...td, color: "var(--muted)", textAlign: "center", padding: 30 }}>
-                    No results yet. Start a scan to populate this table.
+            </tr>
+          </thead>
+          <tbody>
+            {rows.slice(0, 500).map((r) => (
+              <tr key={`${r.ip}:${r.port}`} style={{ borderTop: "1px solid var(--panel-border)" }}>
+                {columns.map((c) => (
+                  <td
+                    key={c.key}
+                    style={{ ...td, color: c.statusColumn ? statusColor(r[c.key]) : undefined }}
+                  >
+                    {c.fmt ? c.fmt(r[c.key]) : r[c.key]}
                   </td>
-                </tr>
-              )}
-            </tbody>
-          </table>
-        </div>
-      </section>
-    </div>
+                ))}
+              </tr>
+            ))}
+            {rows.length === 0 && (
+              <tr>
+                <td colSpan={columns.length} style={{ ...td, color: "var(--muted)", textAlign: "center", padding: 30 }}>
+                  {emptyMessage}
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </section>
   );
 }
 
@@ -489,10 +560,7 @@ function Field({ label, children }) {
 
 function Th({ children, onClick }) {
   return (
-    <th
-      onClick={onClick}
-      style={{ padding: "8px 14px", cursor: "pointer", userSelect: "none" }}
-    >
+    <th onClick={onClick} style={{ padding: "8px 14px", cursor: "pointer", userSelect: "none" }}>
       {children}
     </th>
   );
@@ -502,9 +570,46 @@ const td = { padding: "8px 14px" };
 
 function statusColor(status) {
   if (status === "verified") return "var(--teal)";
-  if (status === "proxy-failed") return "var(--rose)";
+  if (status === "failed") return "var(--rose)";
   return "var(--text)";
 }
+
+const panelStyle = {
+  background: "var(--panel)",
+  border: "1px solid var(--panel-border)",
+  borderRadius: 10,
+  padding: 20,
+  marginBottom: 20,
+};
+
+const infoBoxStyle = {
+  background: "rgba(45,212,191,0.06)",
+  border: "1px solid rgba(45,212,191,0.25)",
+  borderRadius: 8,
+  padding: "12px 16px",
+  marginBottom: 20,
+  fontSize: 13,
+  lineHeight: 1.6,
+  color: "var(--text)",
+};
+
+const errorBoxStyle = {
+  background: "rgba(244,63,94,0.1)",
+  border: "1px solid var(--rose)",
+  color: "var(--rose)",
+  borderRadius: 8,
+  padding: "10px 14px",
+  marginBottom: 16,
+  fontSize: 13,
+};
+
+const captionStyle = {
+  margin: "8px 0 0",
+  fontSize: 12,
+  color: "var(--muted)",
+  lineHeight: 1.5,
+  fontFamily: "var(--font-sans)",
+};
 
 function pillStyle(active) {
   return {
