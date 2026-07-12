@@ -78,7 +78,14 @@ export default function Home() {
   const [rows, setRows] = useState(new Map());
   const [scanSort, setScanSort] = useState({ key: "latencyMs", dir: "asc" });
   const [vlessSort, setVlessSort] = useState({ key: "proxyScore", dir: "desc" });
+  const [scanCollapsed, setScanCollapsed] = useState(false);
+  const [vlessCollapsed, setVlessCollapsed] = useState(false);
   const [error, setError] = useState(null);
+
+  const scrollToId = (id) => {
+    const el = document.getElementById(id);
+    if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
+  };
 
   const stopRef = useRef(false);
 
@@ -458,11 +465,16 @@ export default function Home() {
 
       {/* --- Result 1: scan results --- */}
       <ResultsTable
+        id="scan-results-section"
         title={`SCAN RESULTS (${sortedScanRows.length})`}
         rows={sortedScanRows}
         onSort={onScanSort}
         onExport={() => exportCsv("scan")}
         emptyMessage="No results yet. Start a scan to populate this table."
+        collapsed={scanCollapsed}
+        onToggleCollapse={() => setScanCollapsed((c) => !c)}
+        jumpLabel={sortedVlessRows.length > 0 ? "↓ VLESS results" : null}
+        onJump={() => scrollToId("vless-results-section")}
         columns={[
           { key: "scanScore", label: "Score" },
           { key: "ip", label: "IP" },
@@ -474,11 +486,16 @@ export default function Home() {
       {/* --- Result 2: vless verified results --- */}
       <div style={{ marginTop: 20 }}>
         <ResultsTable
+          id="vless-results-section"
           title={`VLESS VERIFIED RESULTS (${sortedVlessRows.length})`}
           rows={sortedVlessRows}
           onSort={onVlessSort}
           onExport={() => exportCsv("vless")}
           emptyMessage="No candidates verified yet. Run 'Verify top N with VLESS' above."
+          collapsed={vlessCollapsed}
+          onToggleCollapse={() => setVlessCollapsed((c) => !c)}
+          jumpLabel="↑ Scan results"
+          onJump={() => scrollToId("scan-results-section")}
           columns={[
             { key: "proxyScore", label: "Score" },
             { key: "ip", label: "IP" },
@@ -494,56 +511,133 @@ export default function Home() {
   );
 }
 
-function ResultsTable({ title, rows, onSort, onExport, emptyMessage, columns }) {
+function Chevron({ collapsed }) {
   return (
-    <section style={{ ...panelStyle, padding: 0, overflow: "hidden" }}>
+    <svg
+      width="14"
+      height="14"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      style={{
+        transform: collapsed ? "rotate(-90deg)" : "rotate(0deg)",
+        transition: "transform 0.2s ease",
+        flexShrink: 0,
+      }}
+      aria-hidden="true"
+    >
+      <polyline points="6 9 12 15 18 9" />
+    </svg>
+  );
+}
+
+function ResultsTable({
+  id,
+  title,
+  rows,
+  onSort,
+  onExport,
+  emptyMessage,
+  columns,
+  collapsed,
+  onToggleCollapse,
+  jumpLabel,
+  onJump,
+}) {
+  return (
+    <section id={id} style={{ ...panelStyle, padding: 0, overflow: "hidden" }}>
       <div
         style={{
           display: "flex",
           justifyContent: "space-between",
           alignItems: "center",
           padding: "14px 18px",
-          borderBottom: "1px solid var(--panel-border)",
+          borderBottom: collapsed ? "none" : "1px solid var(--panel-border)",
         }}
       >
-        <strong style={{ fontFamily: "var(--font-mono)", fontSize: 13 }}>{title}</strong>
-        <button onClick={onExport} disabled={rows.length === 0} style={secondaryButtonStyle}>
-          Export CSV
+        <button
+          onClick={onToggleCollapse}
+          aria-expanded={!collapsed}
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            background: "transparent",
+            border: "none",
+            color: "var(--text)",
+            cursor: "pointer",
+            padding: "4px 4px 4px 0",
+          }}
+        >
+          <Chevron collapsed={collapsed} />
+          <strong style={{ fontFamily: "var(--font-mono)", fontSize: 13 }}>{title}</strong>
         </button>
+        <div style={{ display: "flex", gap: 16, alignItems: "center" }}>
+          {jumpLabel && (
+            <button onClick={onJump} style={jumpLinkStyle}>
+              {jumpLabel}
+            </button>
+          )}
+          <button onClick={onExport} disabled={rows.length === 0} style={secondaryButtonStyle}>
+            Export CSV
+          </button>
+        </div>
       </div>
-      <div style={{ overflowX: "auto" }}>
-        <table style={{ width: "100%", borderCollapse: "collapse", fontFamily: "var(--font-mono)", fontSize: 13 }}>
-          <thead>
-            <tr style={{ textAlign: "left", color: "var(--muted)" }}>
-              {columns.map((c) => (
-                <Th key={c.key} onClick={() => onSort(c.key)}>
-                  {c.label}
-                </Th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {rows.slice(0, 500).map((r) => (
-              <tr key={`${r.ip}:${r.port}`} style={{ borderTop: "1px solid var(--panel-border)" }}>
-                {columns.map((c) => (
-                  <td
-                    key={c.key}
-                    style={{ ...td, color: c.statusColumn ? statusColor(r[c.key]) : undefined }}
-                  >
-                    {c.fmt ? c.fmt(r[c.key]) : r[c.key]}
-                  </td>
+
+      {/* Pure CSS collapse: animating grid-template-rows between 0fr/1fr
+          lets the browser interpolate to the content's natural height with
+          no JS height measurement, so there's no layout-thrash/jank even
+          on a table with hundreds of rows. */}
+      <div
+        style={{
+          display: "grid",
+          gridTemplateRows: collapsed ? "0fr" : "1fr",
+          transition: "grid-template-rows 0.22s ease",
+        }}
+      >
+        <div style={{ overflow: "hidden", minHeight: 0 }}>
+          <div style={{ overflowX: "auto" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", fontFamily: "var(--font-mono)", fontSize: 13 }}>
+              <thead>
+                <tr style={{ textAlign: "left", color: "var(--muted)" }}>
+                  {columns.map((c) => (
+                    <Th key={c.key} onClick={() => onSort(c.key)}>
+                      {c.label}
+                    </Th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {rows.slice(0, 500).map((r) => (
+                  <tr key={`${r.ip}:${r.port}`} style={{ borderTop: "1px solid var(--panel-border)" }}>
+                    {columns.map((c) => (
+                      <td key={c.key} style={{ ...td, color: c.statusColumn ? statusColor(r[c.key]) : undefined }}>
+                        {c.fmt ? c.fmt(r[c.key]) : r[c.key]}
+                      </td>
+                    ))}
+                  </tr>
                 ))}
-              </tr>
-            ))}
-            {rows.length === 0 && (
-              <tr>
-                <td colSpan={columns.length} style={{ ...td, color: "var(--muted)", textAlign: "center", padding: 30 }}>
-                  {emptyMessage}
-                </td>
-              </tr>
-            )}
-          </tbody>
-        </table>
+                {rows.length === 0 && (
+                  <tr>
+                    <td colSpan={columns.length} style={{ ...td, color: "var(--muted)", textAlign: "center", padding: 30 }}>
+                      {emptyMessage}
+                    </td>
+                  </tr>
+                )}
+                {rows.length > 500 && (
+                  <tr>
+                    <td colSpan={columns.length} style={{ ...td, color: "var(--muted)", textAlign: "center", padding: 14 }}>
+                      Showing top 500 of {rows.length.toLocaleString()} — export CSV for the full set.
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        </div>
       </div>
     </section>
   );
@@ -662,4 +756,14 @@ const secondaryButtonStyle = {
   color: "var(--text)",
   cursor: "pointer",
   fontSize: 13,
+};
+
+const jumpLinkStyle = {
+  background: "transparent",
+  border: "none",
+  color: "var(--teal)",
+  cursor: "pointer",
+  fontSize: 12,
+  fontFamily: "var(--font-mono)",
+  padding: 0,
 };
